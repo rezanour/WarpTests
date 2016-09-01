@@ -44,7 +44,7 @@ struct RotationWarpVertex
 
 struct RotationWarpVSConstants
 {
-    XMFLOAT4X4 InvTWMatrix;
+    XMFLOAT4X4 TWMatrix;
 };
 
 struct PipelineState
@@ -81,8 +81,7 @@ static ComPtr<ID3D11SamplerState> Sampler;
 static PipelineState Pipelines[(uint32_t)PipelineStateIndex::Count];
 static float RotationX = 0.f;
 static float RotationY = 0.f;
-
-static XMFLOAT4X4 ViewProj;
+static bool DrawNative = false;
 
 //==============================================================================
 // Functions
@@ -146,6 +145,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int)
         else
         {
             GraphicsDoFrame();
+            SetWindowText(window, DrawNative ? L"No Warp" : L"Warped");
         }
     }
 
@@ -651,14 +651,30 @@ void GraphicsDrawPipeline(const PipelineState& pipeline)
     Context->DrawIndexed(pipeline.NumIndices, 0, 0);
 }
 
-//#define DRAW_NATIVE
-
 //==============================================================================
 void GraphicsDoFrame()
 {
     static const float clearColor[] = { 0.f, 0.f, 0.f, 1 };
     Context->ClearRenderTargetView(AppFrameRTV.Get(), clearColor);
     Context->ClearRenderTargetView(BackBufferRTV.Get(), clearColor);
+
+    static bool lastSpaceDown = false;
+
+    bool spacePressed = false;
+    if (GetAsyncKeyState(VK_SPACE) & 0x8000)
+    {
+        spacePressed = !lastSpaceDown;
+        lastSpaceDown = true;
+    }
+    else
+    {
+        lastSpaceDown = false;
+    }
+
+    if (spacePressed)
+    {
+        DrawNative = !DrawNative;
+    }
 
     // Update rotational warp params
     static POINT lastMouse{};
@@ -675,17 +691,23 @@ void GraphicsDoFrame()
     XMMATRIX rot = XMMatrixMultiply(XMMatrixRotationY(RotationX), XMMatrixRotationX(RotationY));
     XMMATRIX proj = XMMatrixPerspectiveFovLH(XMConvertToRadians(60.f), 1280.f / 720.f, 0.1f, 1000.f);
 
-#ifdef DRAW_NATIVE
-    XMMATRIX view = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVector3Transform(XMVectorSet(0, 0, 1, 0), rot), XMVectorSet(0, 1, 0, 0));
+    XMMATRIX view = XMMatrixIdentity();
+    XMMATRIX view2 = XMMatrixIdentity();
+    XMMATRIX warp = XMMatrixIdentity();
 
-#else // Draw warped
+    if (DrawNative)
+    {
+        view = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVector3Transform(XMVectorSet(0, 0, 1, 0), rot), XMVectorSet(0, 1, 0, 0));
+        view2 = view;
+    }
+    else
+    {
+        view = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVectorSet(0, 0, 1, 0), XMVectorSet(0, 1, 0, 0));
+        view2 = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVector3Transform(XMVectorSet(0, 0, 1, 0), rot), XMVectorSet(0, 1, 0, 0));
 
-    XMMATRIX view = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVectorSet(0, 0, 1, 0), XMVectorSet(0, 1, 0, 0));
-    XMMATRIX view2 = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVector3Transform(XMVectorSet(0, 0, 1, 0), rot), XMVectorSet(0, 1, 0, 0));
-
-    XMVECTOR det;
-    XMMATRIX warp = XMMatrixMultiply(XMMatrixInverse(&det, view), view2);
-#endif
+        XMVECTOR det;
+        warp = XMMatrixMultiply(XMMatrixInverse(&det, view * proj), view2 * proj);
+    }
 
     // Draw scene
     auto& scenePipeline = GetPipeline(PipelineStateIndex::SceneRender);
@@ -693,7 +715,7 @@ void GraphicsDoFrame()
     SceneVSConstants sceneVSConst{};
     XMStoreFloat4x4(&sceneVSConst.WorldViewProj, XMMatrixMultiply(view, proj));
     Context->UpdateSubresource(scenePipeline.VSConstantBuffer.Get(), 0, nullptr, &sceneVSConst, sizeof(sceneVSConst), 0);
-    
+
     ID3D11ShaderResourceView* nullSRV[] = { nullptr };
     Context->PSSetShaderResources(0, _countof(nullSRV), nullSRV);
     Context->OMSetRenderTargets(1, AppFrameRTV.GetAddressOf(), nullptr);
@@ -701,13 +723,16 @@ void GraphicsDoFrame()
 
     // Rotational warp
     auto& rotationalPipeline = GetPipeline(PipelineStateIndex::RotationalTimewarp);
-    
+
     RotationWarpVSConstants rotationVSConst{};
-#ifdef DRAW_NATIVE
-    XMStoreFloat4x4(&rotationVSConst.InvTWMatrix, XMMatrixIdentity());
-#else // draw warped
-    XMStoreFloat4x4(&rotationVSConst.InvTWMatrix, XMMatrixInverse(&det, warp));
-#endif
+    if (DrawNative)
+    {
+        XMStoreFloat4x4(&rotationVSConst.TWMatrix, XMMatrixIdentity());
+    }
+    else
+    {
+        XMStoreFloat4x4(&rotationVSConst.TWMatrix, warp);
+    }
 
     Context->UpdateSubresource(rotationalPipeline.VSConstantBuffer.Get(), 0, nullptr, &rotationVSConst, sizeof(rotationVSConst), 0);
 
