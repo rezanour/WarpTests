@@ -10,12 +10,16 @@
 #include "ScenePS.h"
 #include "RotationalWarpVS.h"
 #include "RotationalWarpPS.h"
+#include "PositionalWarpVS.h"
+#include "PositionalWarpPS.h"
 
 #include <DirectXMath.h>
 using namespace DirectX;
 
 #include <wrl.h>
 using namespace Microsoft::WRL;
+
+#define ROTATION_WARP
 
 //==============================================================================
 // Constants
@@ -47,6 +51,18 @@ struct RotationWarpVSConstants
     XMFLOAT4X4 TWMatrix;
 };
 
+struct PositionWarpVertex
+{
+    XMFLOAT2 TexCoord;
+};
+
+struct PositionWarpVSConstants
+{
+    XMFLOAT4X4 TWMatrix;
+    XMFLOAT2 TextureSize;
+    XMFLOAT2 Padding;
+};
+
 struct PipelineState
 {
     ComPtr<ID3D11Buffer> VertexBuffer;
@@ -65,6 +81,7 @@ enum class PipelineStateIndex
 {
     SceneRender,
     RotationalTimewarp,
+    PositionalTimewarp,
     Count
 };
 
@@ -76,11 +93,15 @@ static ComPtr<ID3D11DeviceContext> Context;
 static ComPtr<IDXGISwapChain> SwapChain;
 static ComPtr<ID3D11RenderTargetView> BackBufferRTV;
 static ComPtr<ID3D11RenderTargetView> AppFrameRTV;
+static ComPtr<ID3D11DepthStencilView> AppFrameDSV;
 static ComPtr<ID3D11ShaderResourceView> AppFrameSRV;
+static ComPtr<ID3D11ShaderResourceView> AppFrameDepthSRV;
 static ComPtr<ID3D11SamplerState> Sampler;
 static PipelineState Pipelines[(uint32_t)PipelineStateIndex::Count];
 static float RotationX = 0.f;
 static float RotationY = 0.f;
+static float PositionX = 0.f;
+static float PositionY = 0.f;
 static bool DrawNative = false;
 
 //==============================================================================
@@ -94,6 +115,7 @@ static void GraphicsDestroy();
 
 static bool GraphicsCreateScene();
 static bool GraphicsCreateRotationalTimewarp();
+static bool GraphicsCreatePositionalTimewarp();
 
 static bool GraphicsLoadImage(const wchar_t* filename, ID3D11ShaderResourceView** srv);
 
@@ -287,6 +309,37 @@ bool GraphicsInit(HWND hwnd)
         return false;
     }
 
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DEPTH_STENCIL;
+    td.Format = DXGI_FORMAT_R32_TYPELESS;
+
+    hr = Device->CreateTexture2D(&td, nullptr, texture.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsvd{};
+    dsvd.Format = DXGI_FORMAT_D32_FLOAT;
+    dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    hr = Device->CreateDepthStencilView(texture.Get(), &dsvd, &AppFrameDSV);
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd{};
+    srvd.Format = DXGI_FORMAT_R32_FLOAT;
+    srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvd.Texture2D.MipLevels = 1;
+    hr = Device->CreateShaderResourceView(texture.Get(), &srvd, &AppFrameDepthSRV);
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
     D3D11_SAMPLER_DESC sd{};
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -296,6 +349,7 @@ bool GraphicsInit(HWND hwnd)
         assert(false);
         return false;
     }
+    Context->VSSetSamplers(0, 1, Sampler.GetAddressOf());
     Context->PSSetSamplers(0, 1, Sampler.GetAddressOf());
 
     Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -307,6 +361,12 @@ bool GraphicsInit(HWND hwnd)
     }
 
     if (!GraphicsCreateRotationalTimewarp())
+    {
+        assert(false);
+        return false;
+    }
+
+    if (!GraphicsCreatePositionalTimewarp())
     {
         assert(false);
         return false;
@@ -329,7 +389,9 @@ void GraphicsDestroy()
         Pipelines[i].VertexBuffer = nullptr;
     }
 
+    AppFrameDepthSRV = nullptr;
     AppFrameSRV = nullptr;
+    AppFrameDSV = nullptr;
     AppFrameRTV = nullptr;
     BackBufferRTV = nullptr;
     SwapChain = nullptr;
@@ -545,6 +607,110 @@ bool GraphicsCreateRotationalTimewarp()
 }
 
 //==============================================================================
+bool GraphicsCreatePositionalTimewarp()
+{
+    auto& pipeline = GetPipeline(PipelineStateIndex::PositionalTimewarp);
+
+    PositionWarpVertex vertices[NumVertsWidth * NumVertsHeight]{};
+
+    for (int y = 0; y < NumVertsHeight; ++y)
+    {
+        for (int x = 0; x < NumVertsWidth; ++x)
+        {
+            vertices[y * NumVertsWidth + x].TexCoord =
+                XMFLOAT2(x / (float)(NumVertsWidth - 1), y / (float)(NumVertsHeight - 1));
+        }
+    }
+
+    uint32_t indices[(NumVertsWidth - 1) * (NumVertsWidth - 1) * 6]{};
+    for (int y = 0; y < NumVertsHeight - 1; ++y)
+    {
+        for (int x = 0; x < NumVertsWidth - 1; ++x)
+        {
+            indices[(y * (NumVertsWidth - 1) + x) * 6 + 0] = y * NumVertsWidth + x;
+            indices[(y * (NumVertsWidth - 1) + x) * 6 + 1] = y * NumVertsWidth + x + 1;
+            indices[(y * (NumVertsWidth - 1) + x) * 6 + 2] = (y + 1) * NumVertsWidth + x;
+            indices[(y * (NumVertsWidth - 1) + x) * 6 + 3] = (y + 1) * NumVertsWidth + x;
+            indices[(y * (NumVertsWidth - 1) + x) * 6 + 4] = y * NumVertsWidth + x + 1;
+            indices[(y * (NumVertsWidth - 1) + x) * 6 + 5] = (y + 1) * NumVertsWidth + x + 1;
+        }
+    }
+
+    D3D11_BUFFER_DESC bd{};
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.ByteWidth = sizeof(vertices);
+    bd.StructureByteStride = sizeof(PositionWarpVertex);
+
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = vertices;
+    init.SysMemPitch = bd.ByteWidth;
+    init.SysMemSlicePitch = init.SysMemPitch;
+
+    HRESULT hr = Device->CreateBuffer(&bd, &init, &pipeline.VertexBuffer);
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
+    pipeline.Stride = bd.StructureByteStride;
+    pipeline.Offset = 0;
+
+    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    bd.ByteWidth = sizeof(indices);
+    bd.StructureByteStride = sizeof(uint32_t);
+
+    init.pSysMem = indices;
+    init.SysMemPitch = bd.ByteWidth;
+    init.SysMemSlicePitch = init.SysMemPitch;
+
+    hr = Device->CreateBuffer(&bd, &init, &pipeline.IndexBuffer);
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
+    pipeline.NumIndices = _countof(indices);
+
+    hr = Device->CreateVertexShader(PositionalWarpVS, sizeof(PositionalWarpVS), nullptr, &pipeline.VertexShader);
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
+    hr = Device->CreatePixelShader(PositionalWarpPS, sizeof(PositionalWarpPS), nullptr, &pipeline.PixelShader);
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
+    D3D11_INPUT_ELEMENT_DESC elems[1]{};
+    elems[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+    elems[0].SemanticName = "TEXCOORD";
+    hr = Device->CreateInputLayout(elems, _countof(elems), PositionalWarpVS, sizeof(PositionalWarpVS), &pipeline.InputLayout);
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.ByteWidth = sizeof(PositionWarpVSConstants);
+    bd.StructureByteStride = bd.ByteWidth;
+    hr = Device->CreateBuffer(&bd, nullptr, &pipeline.VSConstantBuffer);
+    if (FAILED(hr))
+    {
+        assert(false);
+        return false;
+    }
+
+    return true;
+}
+
+//==============================================================================
 bool GraphicsLoadImage(const wchar_t* filename, ID3D11ShaderResourceView** srv)
 {
     ComPtr<IWICImagingFactory> factory;
@@ -656,6 +822,7 @@ void GraphicsDoFrame()
 {
     static const float clearColor[] = { 0.f, 0.f, 0.f, 1 };
     Context->ClearRenderTargetView(AppFrameRTV.Get(), clearColor);
+    Context->ClearDepthStencilView(AppFrameDSV.Get(), D3D11_CLEAR_DEPTH, 1.f, 0);
     Context->ClearRenderTargetView(BackBufferRTV.Get(), clearColor);
 
     static bool lastSpaceDown = false;
@@ -688,8 +855,31 @@ void GraphicsDoFrame()
     }
     lastMouse = newMouse;
 
+#ifndef ROTATION_WARP
+    // Update positional warp params
+    if (GetAsyncKeyState('A') & 0x8000)
+    {
+        PositionX -= 0.005f;
+    }
+    if (GetAsyncKeyState('D') & 0x8000)
+    {
+        PositionX += 0.005f;
+    }
+    if (GetAsyncKeyState('W') & 0x8000)
+    {
+        PositionY += 0.005f;
+    }
+    if (GetAsyncKeyState('S') & 0x8000)
+    {
+        PositionY -= 0.005f;
+    }
+#endif
+
+    const float zNear = 0.1f;
+    const float zFar = 1000.f;
+
     XMMATRIX rot = XMMatrixMultiply(XMMatrixRotationY(RotationX), XMMatrixRotationX(RotationY));
-    XMMATRIX proj = XMMatrixPerspectiveFovLH(XMConvertToRadians(60.f), 1280.f / 720.f, 0.1f, 1000.f);
+    XMMATRIX proj = XMMatrixPerspectiveFovLH(XMConvertToRadians(60.f), 1280.f / 720.f, zNear, zFar);
 
     XMMATRIX view = XMMatrixIdentity();
     XMMATRIX view2 = XMMatrixIdentity();
@@ -697,13 +887,13 @@ void GraphicsDoFrame()
 
     if (DrawNative)
     {
-        view = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVector3Transform(XMVectorSet(0, 0, 1, 0), rot), XMVectorSet(0, 1, 0, 0));
+        view = XMMatrixLookToLH(XMVectorSet(PositionX, PositionY + 1, -8, 1), XMVector3Transform(XMVectorSet(0, 0, 1, 0), rot), XMVectorSet(0, 1, 0, 0));
         view2 = view;
     }
     else
     {
         view = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVectorSet(0, 0, 1, 0), XMVectorSet(0, 1, 0, 0));
-        view2 = XMMatrixLookToLH(XMVectorSet(0, 1, -8, 1), XMVector3Transform(XMVectorSet(0, 0, 1, 0), rot), XMVectorSet(0, 1, 0, 0));
+        view2 = XMMatrixLookToLH(XMVectorSet(PositionX, PositionY + 1, -8, 1), XMVector3Transform(XMVectorSet(0, 0, 1, 0), rot), XMVectorSet(0, 1, 0, 0));
 
         XMVECTOR det;
         warp = XMMatrixMultiply(XMMatrixInverse(&det, view * proj), view2 * proj);
@@ -716,11 +906,13 @@ void GraphicsDoFrame()
     XMStoreFloat4x4(&sceneVSConst.WorldViewProj, XMMatrixMultiply(view, proj));
     Context->UpdateSubresource(scenePipeline.VSConstantBuffer.Get(), 0, nullptr, &sceneVSConst, sizeof(sceneVSConst), 0);
 
-    ID3D11ShaderResourceView* nullSRV[] = { nullptr };
+    ID3D11ShaderResourceView* nullSRV[] = { nullptr, nullptr };
+    Context->VSSetShaderResources(0, _countof(nullSRV), nullSRV);
     Context->PSSetShaderResources(0, _countof(nullSRV), nullSRV);
-    Context->OMSetRenderTargets(1, AppFrameRTV.GetAddressOf(), nullptr);
+    Context->OMSetRenderTargets(1, AppFrameRTV.GetAddressOf(), AppFrameDSV.Get());
     GraphicsDrawPipeline(scenePipeline);
 
+#ifdef ROTATION_WARP
     // Rotational warp
     auto& rotationalPipeline = GetPipeline(PipelineStateIndex::RotationalTimewarp);
 
@@ -739,6 +931,29 @@ void GraphicsDoFrame()
     Context->OMSetRenderTargets(1, BackBufferRTV.GetAddressOf(), nullptr);
     Context->PSSetShaderResources(0, 1, AppFrameSRV.GetAddressOf());
     GraphicsDrawPipeline(rotationalPipeline);
+
+#else
+    // Positional warp
+    auto& positionalPipeline = GetPipeline(PipelineStateIndex::PositionalTimewarp);
+
+    PositionWarpVSConstants positionVSConst{};
+    if (DrawNative)
+    {
+        XMStoreFloat4x4(&positionVSConst.TWMatrix, XMMatrixIdentity());
+    }
+    else
+    {
+        XMStoreFloat4x4(&positionVSConst.TWMatrix, warp);
+    }
+    positionVSConst.TextureSize = XMFLOAT2(1280, 720);
+
+    Context->UpdateSubresource(positionalPipeline.VSConstantBuffer.Get(), 0, nullptr, &positionVSConst, sizeof(positionVSConst), 0);
+
+    Context->OMSetRenderTargets(1, BackBufferRTV.GetAddressOf(), nullptr);
+    Context->VSSetShaderResources(0, 1, AppFrameDepthSRV.GetAddressOf());
+    Context->PSSetShaderResources(0, 1, AppFrameSRV.GetAddressOf());
+    GraphicsDrawPipeline(positionalPipeline);
+#endif
 
     SwapChain->Present(1, 0);
 }
